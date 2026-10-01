@@ -29,6 +29,10 @@ const (
 	ReasonWrongBlock = "wrong-block-id"
 	// ReasonNoProposal 当前轮次尚不存在提议。
 	ReasonNoProposal = "no-proposal"
+	// ReasonAlreadyVoted 该验证者本轮已投过其他候选，不能改投。
+	ReasonAlreadyVoted = "already-voted"
+	// ReasonUnknownRound 查询的轮次不存在（为 0 或尚未到达）。
+	ReasonUnknownRound = "unknown-round"
 )
 
 // TxStatus 表示一笔交易相对于本节点当前状态的状态。

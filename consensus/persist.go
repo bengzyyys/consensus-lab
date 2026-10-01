@@ -104,5 +104,29 @@ func (s *state) clone() *state {
 			Votes:   append([]string(nil), s.Proposal.Votes...),
 		}
 	}
+	c.Rounds = make(map[uint64]*roundState, len(s.Rounds))
+	for r, rs := range s.Rounds {
+		cr := &roundState{
+			Round:          rs.Round,
+			Height:         rs.Height,
+			PreviousID:     rs.PreviousID,
+			LocalBlockID:   rs.LocalBlockID,
+			Ended:          rs.Ended,
+			EndedByConfirm: rs.EndedByConfirm,
+			DetailMissing:  rs.DetailMissing,
+			Candidates:     make(map[string]*candidateState, len(rs.Candidates)),
+		}
+		for id, cand := range rs.Candidates {
+			cr.Candidates[id] = &candidateState{
+				TxIDs:   append([]string(nil), cand.TxIDs...),
+				BlockID: cand.BlockID,
+				Votes:   append([]string(nil), cand.Votes...),
+				Local:   cand.Local,
+				Decided: cand.Decided,
+				Winner:  cand.Winner,
+			}
+		}
+		c.Rounds[r] = cr
+	}
 	return c
 }
