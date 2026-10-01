@@ -29,6 +29,18 @@ const (
 	ReasonWrongBlock = "wrong-block-id"
 	// ReasonNoProposal 当前轮次尚不存在提议。
 	ReasonNoProposal = "no-proposal"
+	// ReasonTxNotInPool 交易存在但当前不在池中（已确认、过期或被替换）。
+	ReasonTxNotInPool = "tx-not-in-pool"
+	// ReasonTooManyTxs 候选交易数超过单块上限。
+	ReasonTooManyTxs = "too-many-txs"
+	// ReasonSequenceGap 候选中同一账户的序号未从已确认序号加一开始连续递增。
+	ReasonSequenceGap = "sequences-not-consecutive"
+	// ReasonDuplicateTxInCandidate 候选列表中重复出现同一交易。
+	ReasonDuplicateTxInCandidate = "duplicate-tx-in-candidate"
+	// ReasonAlreadyVoted 验证者在本轮已投票给其他候选。
+	ReasonAlreadyVoted = "already-voted"
+	// ReasonUnknownRound 查询的轮次尚无记录。
+	ReasonUnknownRound = "unknown-round"
 )
 
 // TxStatus 表示一笔交易相对于本节点当前状态的状态。
@@ -216,6 +228,48 @@ type AccountInfo struct {
 	Pending []*TxInfo
 	// Gap 因序号缺口等待时，最早缺少的序号；无缺口为 0。
 	Gap uint64
+}
+
+// CandidateStatus 是候选在一轮中的状态。
+type CandidateStatus string
+
+const (
+	// CandidatePending 候选未决，等待投票。
+	CandidatePending CandidateStatus = "pending"
+	// CandidateWon 候选已胜出并确认。
+	CandidateWon CandidateStatus = "won"
+	// CandidateLost 候选已落选。
+	CandidateLost CandidateStatus = "lost"
+)
+
+// CandidateView 是候选的只读查询结果。
+type CandidateView struct {
+	// BlockID 候选区块标识。
+	BlockID string
+	// TxIDs 按候选内顺序排列的交易标识。
+	TxIDs []string
+	// Voters 已投票验证者公钥，按公钥字典序排列。
+	Voters [][]byte
+	// Status 候选状态。
+	Status CandidateStatus
+	// Local 是否为由 Propose 产生的本地候选。
+	Local bool
+}
+
+// RoundView 是按轮次查询候选的只读结果。
+type RoundView struct {
+	// Round 轮次。
+	Round uint64
+	// Candidates 该轮全部候选，按区块标识字典序排列。
+	Candidates []*CandidateView
+	// NotVoted 本轮尚未投票的验证者公钥，按公钥字典序排列。
+	NotVoted [][]byte
+	// Ended 本轮是否被主动结束（未确认任何区块）。
+	Ended bool
+	// Confirmed 本轮是否有候选胜出确认。
+	Confirmed bool
+	// WonBlockID 胜出候选的区块标识；未确认时为空。
+	WonBlockID string
 }
 
 // RejectError 描述一次提交或投票被拒绝的具体原因。

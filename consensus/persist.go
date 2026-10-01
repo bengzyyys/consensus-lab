@@ -104,5 +104,30 @@ func (s *state) clone() *state {
 			Votes:   append([]string(nil), s.Proposal.Votes...),
 		}
 	}
+	for _, cand := range s.Candidates {
+		c.Candidates = append(c.Candidates, &candidateState{
+			BlockID: cand.BlockID,
+			TxIDs:   append([]string(nil), cand.TxIDs...),
+			Votes:   append([]string(nil), cand.Votes...),
+			Local:   cand.Local,
+		})
+	}
+	for _, h := range s.History {
+		rec := &roundRecord{
+			Round:      h.Round,
+			Ended:      h.Ended,
+			WonBlockID: h.WonBlockID,
+		}
+		for _, cr := range h.Candidates {
+			rec.Candidates = append(rec.Candidates, &candidateRecord{
+				BlockID: cr.BlockID,
+				TxIDs:   append([]string(nil), cr.TxIDs...),
+				Votes:   append([]string(nil), cr.Votes...),
+				Local:   cr.Local,
+				Status:  cr.Status,
+			})
+		}
+		c.History = append(c.History, rec)
+	}
 	return c
 }
