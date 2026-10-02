@@ -21,6 +21,9 @@ type Config struct {
 	Validators [][]byte
 	// MaxTxsPerBlock 单块交易上限，必须为正整数。
 	MaxTxsPerBlock uint64
+	// PoolCapacity 交易池容量上限：非负整数，0（或省略）表示不限制。
+	// 与单块交易上限相互独立；只统计排队与等待投票的交易。
+	PoolCapacity uint64
 }
 
 // entryStatus 与对外的 TxStatus 取值一致，额外区分内部存储。
@@ -32,12 +35,16 @@ const (
 	stConfirmed entryStatus = "confirmed"
 	stReplaced  entryStatus = "replaced"
 	stExpired   entryStatus = "expired"
+	stDropped   entryStatus = "dropped"
 )
 
 type poolEntry struct {
 	Tx         *Transaction `json:"tx"`
 	Status     entryStatus  `json:"status"`
 	ReplacedBy string       `json:"replaced_by,omitempty"`
+	// DropReason/DropRound 仅在 Status 为 dropped 时有意义：被挤出的原因与发生轮次。
+	DropReason string `json:"drop_reason,omitempty"`
+	DropRound  uint64 `json:"drop_round,omitempty"`
 }
 
 type confirmedRef struct {
@@ -84,24 +91,27 @@ type roundState struct {
 
 // state 是持久化到磁盘的完整节点状态。
 type state struct {
-	Version    int                          `json:"version"`
-	Seed       []byte                       `json:"seed"`
-	Validators [][]byte                     `json:"validators"`
-	MaxTxs     uint64                       `json:"max_txs_per_block"`
-	Round      uint64                       `json:"round"`
-	LastBlock  string                       `json:"last_block_id"`
-	Accounts   map[string]uint64            `json:"accounts"` // 发送者十六进制公钥 -> 已确认序号
-	Pool       map[string]map[uint64]string `json:"pool"`     // 发送者 -> 序号 -> 交易标识（含已提议交易）
-	Entries    map[string]*poolEntry        `json:"entries"`
-	Confirmed  map[string]confirmedRef      `json:"confirmed"`
-	Blocks     []Block                      `json:"blocks"`
+	Version    int      `json:"version"`
+	Seed       []byte   `json:"seed"`
+	Validators [][]byte `json:"validators"`
+	MaxTxs     uint64   `json:"max_txs_per_block"`
+	// Capacity 交易池容量上限，0 表示不限制。版本 1、2 的状态未保存该字段，
+	// 打开时保持零值，即按不限制处理。
+	Capacity  uint64                       `json:"pool_capacity"`
+	Round     uint64                       `json:"round"`
+	LastBlock string                       `json:"last_block_id"`
+	Accounts  map[string]uint64            `json:"accounts"` // 发送者十六进制公钥 -> 已确认序号
+	Pool      map[string]map[uint64]string `json:"pool"`     // 发送者 -> 序号 -> 交易标识（含已提议交易）
+	Entries   map[string]*poolEntry        `json:"entries"`
+	Confirmed map[string]confirmedRef      `json:"confirmed"`
+	Blocks    []Block                      `json:"blocks"`
 	// Rounds 按轮次保存候选与结果，含已决出的历史轮次。
 	Rounds map[uint64]*roundState `json:"rounds,omitempty"`
 	// Proposal 仅用于读取版本 1 的旧状态文件；版本 2 起一律由 Rounds 表达。
 	Proposal *proposalState `json:"proposal,omitempty"`
 }
 
-const stateVersion = 2
+const stateVersion = 3
 const stateFileName = "state.json"
 
 // Node 是一个本地共识节点。一个进程内可串行调用其方法。
@@ -159,6 +169,7 @@ func New(dir string, cfg Config) (*Node, error) {
 		Seed:       append([]byte(nil), cfg.Seed...),
 		Validators: validators,
 		MaxTxs:     cfg.MaxTxsPerBlock,
+		Capacity:   cfg.PoolCapacity,
 		Round:      1, // 轮次从 1 开始
 		Accounts:   map[string]uint64{},
 		Pool:       map[string]map[uint64]string{},
@@ -186,7 +197,7 @@ func Open(dir string) (*Node, error) {
 	if err := json.Unmarshal(raw, st); err != nil {
 		return nil, fmt.Errorf("corrupt state file %s: %w", path, err)
 	}
-	if st.Version != 1 && st.Version != stateVersion {
+	if st.Version < 1 || st.Version > stateVersion {
 		return nil, fmt.Errorf("unsupported state version %d", st.Version)
 	}
 	if st.Round == 0 {
@@ -198,6 +209,8 @@ func Open(dir string) (*Node, error) {
 	if st.Version == 1 {
 		migrateV1(st)
 	}
+	// 版本 1、2 的状态未保存容量：Capacity 保持零值，即不限制；确认历史原样保留。
+	st.Version = stateVersion
 	return &Node{dir: dir, st: st}, nil
 }
 
@@ -258,6 +271,8 @@ type ConfigSnapshot struct {
 	Seed           []byte
 	Validators     [][]byte
 	MaxTxsPerBlock uint64
+	// PoolCapacity 交易池容量上限，0 表示不限制。
+	PoolCapacity uint64
 }
 
 // Config 返回初始化时的配置副本。
@@ -272,6 +287,7 @@ func (n *Node) Config() ConfigSnapshot {
 		Seed:           append([]byte(nil), n.st.Seed...),
 		Validators:     vals,
 		MaxTxsPerBlock: n.st.MaxTxs,
+		PoolCapacity:   n.st.Capacity,
 	}
 }
 
@@ -314,10 +330,17 @@ type SubmitResult struct {
 	TxID string
 	// ReplacedID 若本次提交替换了旧交易，为旧交易标识；否则为空。
 	ReplacedID string
+	// EvictedID 若本次提交因池满挤出了旧交易，为被挤出交易的标识；否则为空。
+	EvictedID string
 }
 
 // Submit 校验并接收一笔交易进入交易池。
 // 拒绝时返回 *RejectError，可通过其 Reason 取得具体原因。
+//
+// 现有校验与拒绝原因优先于容量判断。同发送者同序号的合法加费替换不增加计数，
+// 满池也可执行且不淘汰其他交易。全新交易在池满时只能从未被任何未决候选引用的
+// 排队交易中挤出费用最低（同费取标识字典序最大）的一笔，且仅当新交易费用更高、
+// 或费用相同且标识更小时成功；否则以 ReasonPoolFull 拒绝，池状态不变、不留历史。
 func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 	if tx == nil {
 		return nil, errors.New("nil transaction")
@@ -333,7 +356,7 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 		return nil, reject(ReasonBadSignature, "signature verification failed for sender %x", tx.Sender)
 	}
 	id := tx.ID()
-	// 同一标识的交易再次提交，一律视为重复（即使此前已确认、被替换或过期）。
+	// 同一标识的交易再次提交，一律视为重复（即使此前已确认、被替换、过期或被挤出）。
 	if _, ok := cur.Entries[id]; ok {
 		return nil, reject(ReasonDuplicate, "transaction %s already exists", id)
 	}
@@ -345,8 +368,10 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 		return nil, reject(ReasonOldSequence, "sequence %d is not greater than confirmed sequence %d", tx.Sequence, confirmed)
 	}
 	seqs := cur.Pool[sender]
+	isReplace := false
 	if seqs != nil {
 		if oldID, ok := seqs[tx.Sequence]; ok {
+			isReplace = true
 			old := cur.Entries[oldID]
 			if old.Status == stProposed {
 				return nil, reject(ReasonProposalLocked, "sequence %d is referenced by a pending candidate and cannot be replaced", tx.Sequence)
@@ -357,6 +382,23 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 		}
 	}
 
+	// 容量判断位于全部现有校验之后，且只针对新占位置的交易。
+	var evictID string
+	if !isReplace && cur.Capacity > 0 && cur.poolSize() >= cur.Capacity {
+		victim, ok := cur.evictionVictim()
+		if !ok {
+			return nil, reject(ReasonPoolFull,
+				"pool is full (%d/%d transactions) and no queued transaction is evictable", cur.poolSize(), cur.Capacity)
+		}
+		ve := cur.Entries[victim]
+		if tx.Fee < ve.Tx.Fee || (tx.Fee == ve.Tx.Fee && id > victim) {
+			return nil, reject(ReasonPoolFull,
+				"pool is full (%d/%d transactions): new transaction (fee %d) does not beat evictable transaction %s (fee %d)",
+				cur.poolSize(), cur.Capacity, tx.Fee, victim, ve.Tx.Fee)
+		}
+		evictID = victim
+	}
+
 	// 校验通过后在副本上修改，落盘成功才替换内存，失败时确认前状态保持不变。
 	st := cur.clone()
 	result := &SubmitResult{TxID: id}
@@ -365,6 +407,18 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 		old.Status = stReplaced
 		old.ReplacedBy = id
 		result.ReplacedID = oldID
+	} else if evictID != "" {
+		// 接收新交易与淘汰旧交易在同一个副本上一起生效、一起落盘。
+		v := st.Entries[evictID]
+		v.Status = stDropped
+		v.DropReason = DropReasonPoolCapacity
+		v.DropRound = st.Round
+		vsender := v.Tx.SenderHex()
+		delete(st.Pool[vsender], v.Tx.Sequence)
+		if len(st.Pool[vsender]) == 0 {
+			delete(st.Pool, vsender)
+		}
+		result.EvictedID = evictID
 	}
 
 	txCopy := *tx
@@ -384,6 +438,37 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 	return result, nil
 }
 
+// poolSize 返回当前占位的交易数：排队与等待投票（被未决候选引用）的交易。
+// 同一交易被多个候选引用只算一笔；已确认、被替换、已过期与被挤出的历史不占位置。
+func (s *state) poolSize() uint64 {
+	var n uint64
+	for _, seqs := range s.Pool {
+		n += uint64(len(seqs))
+	}
+	return n
+}
+
+// evictionVictim 选出满池时唯一可被淘汰的交易：未被任何未决候选引用的排队
+// 交易中费用最低者，费用相同取交易标识字典序最大者。选择只取决于费用与标识，
+// 与遍历顺序无关，结果确定。无可淘汰交易时第二个返回值为 false。
+func (s *state) evictionVictim() (string, bool) {
+	var victim string
+	var victimFee uint64
+	found := false
+	for _, seqs := range s.Pool {
+		for _, id := range seqs {
+			e := s.Entries[id]
+			if e.Status != stQueued {
+				continue // 被未决候选引用的交易受保护
+			}
+			if !found || e.Tx.Fee < victimFee || (e.Tx.Fee == victimFee && id > victim) {
+				victim, victimFee, found = id, e.Tx.Fee, true
+			}
+		}
+	}
+	return victim, found
+}
+
 // 额外拒绝原因。
 const (
 	// ReasonProposalLocked 同发送者同序号交易已被未决候选引用，禁止替换。
@@ -392,7 +477,7 @@ const (
 	ReasonUnknownTx = "unknown-transaction"
 	// ReasonUnknownBlock 查询的区块高度不存在。
 	ReasonUnknownBlock = "unknown-block"
-	// ReasonTxNotInPool 候选引用了已退出交易池的交易（已确认、被替换或已过期）。
+	// ReasonTxNotInPool 候选引用了已退出交易池的交易（已确认、被替换、已过期或被挤出）。
 	ReasonTxNotInPool = "tx-not-in-pool"
 	// ReasonDuplicateInList 候选列表中同一交易出现多次。
 	ReasonDuplicateInList = "duplicate-in-list"
@@ -982,6 +1067,10 @@ func (n *Node) Tx(id string) (*TxInfo, error) {
 				info.BlockHeight = ref.Height
 				info.BlockID = ref.Block
 			}
+		}
+		if e.Status == stDropped {
+			info.DropReason = e.DropReason
+			info.DropRound = e.DropRound
 		}
 		return info, nil
 	}

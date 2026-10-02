@@ -21,6 +21,8 @@ const (
 	ReasonDuplicate = "duplicate-transaction"
 	// ReasonLowFee 池中同发送者同序号已有交易，但新交易费用没有严格更高。
 	ReasonLowFee = "fee-not-higher"
+	// ReasonPoolFull 交易池已满，且新交易不足以挤出任何可淘汰的排队交易。
+	ReasonPoolFull = "pool-full"
 	// ReasonNotValidator 投票者不在验证者名单内。
 	ReasonNotValidator = "not-validator"
 	// ReasonWrongRound 投票轮次与当前轮次不一致。
@@ -49,7 +51,12 @@ const (
 	StatusReplaced TxStatus = "replaced"
 	// StatusExpired 在进入新轮次时因到期轮次不大于当前轮次而失效。
 	StatusExpired TxStatus = "expired"
+	// StatusDropped 在交易池满时被费用更高的新交易挤出。
+	StatusDropped TxStatus = "dropped"
 )
+
+// DropReasonPoolCapacity 是交易被挤出交易池时记录的原因：池容量限制。
+const DropReasonPoolCapacity = "pool-capacity"
 
 // Transaction 是一笔带 Ed25519 签名的交易。
 type Transaction struct {
@@ -207,6 +214,10 @@ type TxInfo struct {
 	BlockID string
 	// ReplacedBy 已替换时的新交易标识。
 	ReplacedBy string
+	// DropReason 被挤出时的原因（pool-capacity）；其他状态为空。
+	DropReason string
+	// DropRound 被挤出发生的轮次；其他状态为 0。
+	DropRound uint64
 	// Note 仅用于待处理交易："waiting-vote"（已提议，等待投票）或 "waiting-pack"（池内，等待打包）。
 	Note string
 }
