@@ -55,6 +55,7 @@ func (s *state) clone() *state {
 		Version:   s.Version,
 		Seed:      append([]byte(nil), s.Seed...),
 		MaxTxs:    s.MaxTxs,
+		PoolCap:   s.PoolCap,
 		Round:     s.Round,
 		LastBlock: s.LastBlock,
 		Accounts:  make(map[string]uint64, len(s.Accounts)),
@@ -82,6 +83,8 @@ func (s *state) clone() *state {
 			Tx:         copyTx(e.Tx),
 			Status:     e.Status,
 			ReplacedBy: e.ReplacedBy,
+			DropReason: e.DropReason,
+			DropRound:  e.DropRound,
 		}
 	}
 	for id, ref := range s.Confirmed {

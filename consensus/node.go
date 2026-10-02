@@ -21,6 +21,10 @@ type Config struct {
 	Validators [][]byte
 	// MaxTxsPerBlock 单块交易上限，必须为正整数。
 	MaxTxsPerBlock uint64
+	// PoolCapacity 交易池容量：当前排队与等待投票的交易总数上限，
+	// 同一交易被多个候选引用只算一笔。0 表示不限制，省略时保持现有行为。
+	// 与单块交易上限相互独立。
+	PoolCapacity uint64
 }
 
 // entryStatus 与对外的 TxStatus 取值一致，额外区分内部存储。
@@ -32,12 +36,15 @@ const (
 	stConfirmed entryStatus = "confirmed"
 	stReplaced  entryStatus = "replaced"
 	stExpired   entryStatus = "expired"
+	stDropped   entryStatus = "dropped"
 )
 
 type poolEntry struct {
 	Tx         *Transaction `json:"tx"`
 	Status     entryStatus  `json:"status"`
 	ReplacedBy string       `json:"replaced_by,omitempty"`
+	DropReason string       `json:"drop_reason,omitempty"`
+	DropRound  uint64       `json:"drop_round,omitempty"`
 }
 
 type confirmedRef struct {
@@ -88,6 +95,7 @@ type state struct {
 	Seed       []byte                       `json:"seed"`
 	Validators [][]byte                     `json:"validators"`
 	MaxTxs     uint64                       `json:"max_txs_per_block"`
+	PoolCap    uint64                       `json:"pool_capacity"` // 0 表示不限制；旧状态文件无此字段时按不限制处理
 	Round      uint64                       `json:"round"`
 	LastBlock  string                       `json:"last_block_id"`
 	Accounts   map[string]uint64            `json:"accounts"` // 发送者十六进制公钥 -> 已确认序号
@@ -159,6 +167,7 @@ func New(dir string, cfg Config) (*Node, error) {
 		Seed:       append([]byte(nil), cfg.Seed...),
 		Validators: validators,
 		MaxTxs:     cfg.MaxTxsPerBlock,
+		PoolCap:    cfg.PoolCapacity,
 		Round:      1, // 轮次从 1 开始
 		Accounts:   map[string]uint64{},
 		Pool:       map[string]map[uint64]string{},
@@ -258,6 +267,7 @@ type ConfigSnapshot struct {
 	Seed           []byte
 	Validators     [][]byte
 	MaxTxsPerBlock uint64
+	PoolCapacity   uint64
 }
 
 // Config 返回初始化时的配置副本。
@@ -272,6 +282,7 @@ func (n *Node) Config() ConfigSnapshot {
 		Seed:           append([]byte(nil), n.st.Seed...),
 		Validators:     vals,
 		MaxTxsPerBlock: n.st.MaxTxs,
+		PoolCapacity:   n.st.PoolCap,
 	}
 }
 
@@ -314,6 +325,8 @@ type SubmitResult struct {
 	TxID string
 	// ReplacedID 若本次提交替换了旧交易，为旧交易标识；否则为空。
 	ReplacedID string
+	// EvictedID 若本次提交因池满挤出了一笔排队交易，为被挤出交易标识；否则为空。
+	EvictedID string
 }
 
 // Submit 校验并接收一笔交易进入交易池。
@@ -360,11 +373,34 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 	// 校验通过后在副本上修改，落盘成功才替换内存，失败时确认前状态保持不变。
 	st := cur.clone()
 	result := &SubmitResult{TxID: id}
+	isReplace := false
 	if oldID, ok := st.Pool[sender][tx.Sequence]; ok {
 		old := st.Entries[oldID]
 		old.Status = stReplaced
 		old.ReplacedBy = id
 		result.ReplacedID = oldID
+		isReplace = true
+	}
+
+	// 容量判断：加费替换不增加计数，满池也可执行且不得淘汰别的交易；
+	// 新增交易在池满时只能挤出未被任何未决候选引用的排队交易。
+	if !isReplace && st.PoolCap > 0 && st.poolSize() >= int(st.PoolCap) {
+		victimID, victimFee := st.findEvictable()
+		// 新交易只有费用更高，或费用相同且标识更小时，才能挤出 victim。
+		if victimID == "" || tx.Fee < victimFee || (tx.Fee == victimFee && id >= victimID) {
+			return nil, reject(ReasonPoolFull,
+				"pool is full (capacity %d) and transaction %s cannot evict any queued transaction", st.PoolCap, id)
+		}
+		victim := st.Entries[victimID]
+		victim.Status = stDropped
+		victim.DropReason = DropReasonPoolCapacity
+		victim.DropRound = st.Round
+		vSender := victim.Tx.SenderHex()
+		delete(st.Pool[vSender], victim.Tx.Sequence)
+		if len(st.Pool[vSender]) == 0 {
+			delete(st.Pool, vSender)
+		}
+		result.EvictedID = victimID
 	}
 
 	txCopy := *tx
@@ -400,6 +436,14 @@ const (
 	ReasonTooManyTxs = "too-many-transactions"
 	// ReasonSequenceGap 候选中某账户的序号未从已确认序号加一开始连续递增。
 	ReasonSequenceGap = "sequence-not-consecutive"
+	// ReasonPoolFull 交易池已满，且新交易不满足挤出条件（无可淘汰者或费用/标识不占优）。
+	ReasonPoolFull = "pool-full"
+)
+
+// 交易被挤出的原因。
+const (
+	// DropReasonPoolCapacity 因交易池容量限制被挤出。
+	DropReasonPoolCapacity = "pool-capacity"
 )
 
 // currentRoundState 返回当前轮次状态；尚未产生本地提议时可能为 nil。
@@ -597,6 +641,35 @@ func (n *Node) RegisterCandidate(round uint64, txIDs []string) (*RegisterResult,
 func inPool(st *state, sender string, seq uint64, id string) bool {
 	cur, ok := st.Pool[sender][seq]
 	return ok && cur == id
+}
+
+// poolSize 返回当前占用容量的交易数：排队与等待投票（已被候选引用）的交易，
+// 同一交易被多个候选引用只算一笔；已确认、被替换、过期与被挤出的历史不占位置。
+func (s *state) poolSize() int {
+	n := 0
+	for _, e := range s.Entries {
+		if e.Status == stQueued || e.Status == stProposed {
+			n++
+		}
+	}
+	return n
+}
+
+// findEvictable 返回池满时可被挤出的交易：仅排队（未被任何未决候选引用）交易中
+// 费用最低者，费用相同取交易标识字典序最大者。没有可淘汰者时第二个返回值为 0。
+func (s *state) findEvictable() (string, uint64) {
+	var bestID string
+	var bestFee uint64
+	for id, e := range s.Entries {
+		if e.Status != stQueued {
+			continue
+		}
+		if bestID == "" || e.Tx.Fee < bestFee || (e.Tx.Fee == bestFee && id > bestID) {
+			bestID = id
+			bestFee = e.Tx.Fee
+		}
+	}
+	return bestID, bestFee
 }
 
 // selectTransactions 执行确定性打包：
@@ -982,6 +1055,10 @@ func (n *Node) Tx(id string) (*TxInfo, error) {
 				info.BlockHeight = ref.Height
 				info.BlockID = ref.Block
 			}
+		}
+		if e.Status == stDropped {
+			info.DropReason = e.DropReason
+			info.DropRound = e.DropRound
 		}
 		return info, nil
 	}

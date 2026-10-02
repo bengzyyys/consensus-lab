@@ -4,6 +4,7 @@
 //
 //	n, err := consensus.New(dir, consensus.Config{
 //	    Seed: seed, Validators: validatorKeys, MaxTxsPerBlock: 10,
+//	    PoolCapacity: 100, // 0 或省略表示交易池不限制
 //	})
 //	tx := consensus.NewTransaction(priv, 1, []byte("hello"), 5, 100)
 //	if _, err := n.Submit(tx); err != nil { … }

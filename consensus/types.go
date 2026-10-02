@@ -49,6 +49,8 @@ const (
 	StatusReplaced TxStatus = "replaced"
 	// StatusExpired 在进入新轮次时因到期轮次不大于当前轮次而失效。
 	StatusExpired TxStatus = "expired"
+	// StatusDropped 在交易池容量受限时被新交易挤出。
+	StatusDropped TxStatus = "dropped"
 )
 
 // Transaction 是一笔带 Ed25519 签名的交易。
@@ -207,6 +209,10 @@ type TxInfo struct {
 	BlockID string
 	// ReplacedBy 已替换时的新交易标识。
 	ReplacedBy string
+	// DropReason 被挤出时的原因（"pool-capacity"）；其他状态为空。
+	DropReason string
+	// DropRound 被挤出时的发生轮次；其他状态为 0。
+	DropRound uint64
 	// Note 仅用于待处理交易："waiting-vote"（已提议，等待投票）或 "waiting-pack"（池内，等待打包）。
 	Note string
 }
