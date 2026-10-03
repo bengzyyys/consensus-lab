@@ -800,7 +800,9 @@ func (n *Node) Vote(validator []byte, round uint64, blockID string) (*VoteResult
 	if len(cand.Votes) > threshold {
 		block := st.resolveRound(cand.BlockID, true)
 		res.Confirmed = true
-		res.Block = &block
+		// 返回独立快照，调用方改写 res.Block 不会触及已保存进 st 的确认块。
+		snap := copyBlock(&block)
+		res.Block = &snap
 	}
 	if err := n.save(st); err != nil {
 		return nil, err
@@ -821,15 +823,18 @@ func (s *state) resolveRound(winnerID string, confirm bool) Block {
 	if confirm {
 		winner := rs.Candidates[winnerID]
 		height := uint64(len(s.Blocks)) + 1
+		// 历史中保存的是胜出候选交易列表的独立副本：调用方对 Vote 返回块的
+		// 改写（交换顺序、改标识、增减长度）不会触及确认历史，也不会随后续保存落盘。
+		txIDs := append([]string{}, winner.TxIDs...)
+		if txIDs == nil {
+			txIDs = []string{}
+		}
 		block = Block{
 			Height:     height,
 			Round:      rs.Round,
 			ID:         winner.BlockID,
 			PreviousID: s.LastBlock,
-			TxIDs:      append([]string(nil), winner.TxIDs...),
-		}
-		if block.TxIDs == nil {
-			block.TxIDs = []string{}
+			TxIDs:      txIDs,
 		}
 		for _, id := range block.TxIDs {
 			winnerTx[id] = struct{}{}
@@ -928,17 +933,18 @@ func (n *Node) BlockAt(height uint64) (Block, error) {
 	if height == 0 || height > uint64(len(n.st.Blocks)) {
 		return Block{}, reject(ReasonUnknownBlock, "block at height %d does not exist", height)
 	}
-	return n.st.Blocks[height-1], nil
+	return copyBlock(&n.st.Blocks[height-1]), nil
 }
 
 // LatestBlock 返回最新确认块；尚无确认块时第二返回值为 false。
+// 返回的是取得时的独立快照，调用方改写不影响节点内的确认历史。
 func (n *Node) LatestBlock() (Block, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if len(n.st.Blocks) == 0 {
 		return Block{}, false
 	}
-	return n.st.Blocks[len(n.st.Blocks)-1], true
+	return copyBlock(&n.st.Blocks[len(n.st.Blocks)-1]), true
 }
 
 // 候选结果取值。
@@ -1135,4 +1141,21 @@ func copyTx(tx *Transaction) *Transaction {
 	c.Content = append([]byte(nil), tx.Content...)
 	c.Signature = append([]byte(nil), tx.Signature...)
 	return &c
+}
+
+// copyBlock 返回确认块的独立快照：高度、轮次、区块标识、前块标识复制为值，
+// 交易列表使用独立切片。调用方交换顺序、改写标识或增减长度都只影响手中的结果，
+// 既不会污染节点内的确认历史，也不会随后续保存写入磁盘。空块保留零长度切片。
+func copyBlock(b *Block) Block {
+	txIDs := append([]string{}, b.TxIDs...)
+	if txIDs == nil {
+		txIDs = []string{}
+	}
+	return Block{
+		Height:     b.Height,
+		Round:      b.Round,
+		ID:         b.ID,
+		PreviousID: b.PreviousID,
+		TxIDs:      txIDs,
+	}
 }
