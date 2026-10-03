@@ -200,6 +200,19 @@ type Block struct {
 	TxIDs      []string `json:"tx_ids"`
 }
 
+// snapshotBlock 返回确认块的独立快照：复制交易标识切片，调用方此后交换、
+// 改写或增删返回结果中的标识都只影响其手中的副本，不会波及节点内部历史，
+// 也不会随后续保存进入持久化状态。空块仍返回零长度（非 nil）切片。
+func snapshotBlock(b Block) Block {
+	out := b
+	if b.TxIDs != nil {
+		out.TxIDs = append([]string(nil), b.TxIDs...)
+	} else {
+		out.TxIDs = []string{}
+	}
+	return out
+}
+
 // TxInfo 是一笔交易的查询结果。
 type TxInfo struct {
 	// ID 交易标识。

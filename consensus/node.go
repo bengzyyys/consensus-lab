@@ -800,7 +800,9 @@ func (n *Node) Vote(validator []byte, round uint64, blockID string) (*VoteResult
 	if len(cand.Votes) > threshold {
 		block := st.resolveRound(cand.BlockID, true)
 		res.Confirmed = true
-		res.Block = &block
+		// 返回独立快照，调用方改写确认结果不能污染已保存的确认块。
+		snapshot := snapshotBlock(block)
+		res.Block = &snapshot
 	}
 	if err := n.save(st); err != nil {
 		return nil, err
@@ -928,7 +930,7 @@ func (n *Node) BlockAt(height uint64) (Block, error) {
 	if height == 0 || height > uint64(len(n.st.Blocks)) {
 		return Block{}, reject(ReasonUnknownBlock, "block at height %d does not exist", height)
 	}
-	return n.st.Blocks[height-1], nil
+	return snapshotBlock(n.st.Blocks[height-1]), nil
 }
 
 // LatestBlock 返回最新确认块；尚无确认块时第二返回值为 false。
@@ -938,7 +940,7 @@ func (n *Node) LatestBlock() (Block, bool) {
 	if len(n.st.Blocks) == 0 {
 		return Block{}, false
 	}
-	return n.st.Blocks[len(n.st.Blocks)-1], true
+	return snapshotBlock(n.st.Blocks[len(n.st.Blocks)-1]), true
 }
 
 // 候选结果取值。
