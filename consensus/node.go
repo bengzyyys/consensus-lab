@@ -391,7 +391,9 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 				"pool is full (%d/%d transactions) and no queued transaction is evictable", cur.poolSize(), cur.Capacity)
 		}
 		ve := cur.Entries[victim]
-		if tx.Fee < ve.Tx.Fee || (tx.Fee == ve.Tx.Fee && id > victim) {
+		// 新交易必须严格优于可淘汰者（费用更高，或同费且标识更小）才接收；
+		// 同标识已在前面的重复校验中拒绝，故 <=0 即视为不值得挤出。
+		if cmpTxPriority(tx.Fee, id, ve.Tx.Fee, victim) <= 0 {
 			return nil, reject(ReasonPoolFull,
 				"pool is full (%d/%d transactions): new transaction (fee %d) does not beat evictable transaction %s (fee %d)",
 				cur.poolSize(), cur.Capacity, tx.Fee, victim, ve.Tx.Fee)
@@ -449,8 +451,9 @@ func (s *state) poolSize() uint64 {
 }
 
 // evictionVictim 选出满池时唯一可被淘汰的交易：未被任何未决候选引用的排队
-// 交易中费用最低者，费用相同取交易标识字典序最大者。选择只取决于费用与标识，
-// 与遍历顺序无关，结果确定。无可淘汰交易时第二个返回值为 false。
+// 交易中优先级最低者（费用最低；费用相同取交易标识字典序最大）。高低关系与
+// 打包、接收共用 cmpTxPriority，与遍历顺序无关，结果确定。
+// 无可淘汰交易时第二个返回值为 false。
 func (s *state) evictionVictim() (string, bool) {
 	var victim string
 	var victimFee uint64
@@ -461,7 +464,7 @@ func (s *state) evictionVictim() (string, bool) {
 			if e.Status != stQueued {
 				continue // 被未决候选引用的交易受保护
 			}
-			if !found || e.Tx.Fee < victimFee || (e.Tx.Fee == victimFee && id > victim) {
+			if !found || cmpTxPriority(e.Tx.Fee, id, victimFee, victim) < 0 {
 				victim, victimFee, found = id, e.Tx.Fee, true
 			}
 		}
@@ -713,7 +716,7 @@ func (n *state) selectTransactions() []string {
 			if e.Status != stQueued {
 				continue
 			}
-			if !bestSet || e.Tx.Fee > bestFee || (e.Tx.Fee == bestFee && id < bestID) {
+			if !bestSet || cmpTxPriority(e.Tx.Fee, id, bestFee, bestID) > 0 {
 				bestID = id
 				bestFee = e.Tx.Fee
 				bestSet = true
