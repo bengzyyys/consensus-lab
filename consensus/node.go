@@ -391,7 +391,9 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 				"pool is full (%d/%d transactions) and no queued transaction is evictable", cur.poolSize(), cur.Capacity)
 		}
 		ve := cur.Entries[victim]
-		if tx.Fee < ve.Tx.Fee || (tx.Fee == ve.Tx.Fee && id > victim) {
+		// 新交易必须严格优于当前优先级最低的可淘汰交易才接收：
+		// 费用更高，或费用相同且新标识字典序更小。
+		if !higherPriority(tx.Fee, id, ve.Tx.Fee, victim) {
 			return nil, reject(ReasonPoolFull,
 				"pool is full (%d/%d transactions): new transaction (fee %d) does not beat evictable transaction %s (fee %d)",
 				cur.poolSize(), cur.Capacity, tx.Fee, victim, ve.Tx.Fee)
@@ -438,6 +440,15 @@ func (n *Node) Submit(tx *Transaction) (*SubmitResult, error) {
 	return result, nil
 }
 
+// higherPriority 是交易优先级的唯一比较规则：费用更高者优先；
+// 费用相同，交易标识按字典序更小者优先。费用按无符号 64 位整数直接比较，
+// 0 与最大值也能正确区分高低，相差很大的两笔费用不会反转或被判为相同；
+// 同费时以完整交易标识的字典序为准。
+// 打包选优、满池找可淘汰交易、判断新交易是否值得接收都通过它表达高低关系。
+func higherPriority(feeA uint64, idA string, feeB uint64, idB string) bool {
+	return feeA > feeB || (feeA == feeB && idA < idB)
+}
+
 // poolSize 返回当前占位的交易数：排队与等待投票（被未决候选引用）的交易。
 // 同一交易被多个候选引用只算一笔；已确认、被替换、已过期与被挤出的历史不占位置。
 func (s *state) poolSize() uint64 {
@@ -449,8 +460,8 @@ func (s *state) poolSize() uint64 {
 }
 
 // evictionVictim 选出满池时唯一可被淘汰的交易：未被任何未决候选引用的排队
-// 交易中费用最低者，费用相同取交易标识字典序最大者。选择只取决于费用与标识，
-// 与遍历顺序无关，结果确定。无可淘汰交易时第二个返回值为 false。
+// 交易中优先级最低者（费用最低，费用相同取交易标识字典序最大者）。
+// 选择只取决于费用与标识，与遍历顺序无关，结果确定。无可淘汰交易时第二个返回值为 false。
 func (s *state) evictionVictim() (string, bool) {
 	var victim string
 	var victimFee uint64
@@ -461,7 +472,8 @@ func (s *state) evictionVictim() (string, bool) {
 			if e.Status != stQueued {
 				continue // 被未决候选引用的交易受保护
 			}
-			if !found || e.Tx.Fee < victimFee || (e.Tx.Fee == victimFee && id > victim) {
+			// 候选比当前受害者优先级更低（即受害者更高）时，改选候选。
+			if !found || higherPriority(victimFee, victim, e.Tx.Fee, id) {
 				victim, victimFee, found = id, e.Tx.Fee, true
 			}
 		}
@@ -685,7 +697,7 @@ func inPool(st *state, sender string, seq uint64, id string) bool {
 }
 
 // selectTransactions 执行确定性打包：
-// 每轮从各账户“下一条可确认”的交易中选费用最高者，费用相同按交易标识字典序；
+// 每轮从各账户“下一条可确认”的交易中选优先级最高者（费用由 higherPriority 比较），
 // 选入某账户后才继续考虑其后续序号，直到达到上限或没有可选交易。
 func (n *state) selectTransactions() []string {
 	var picked []string
@@ -713,7 +725,7 @@ func (n *state) selectTransactions() []string {
 			if e.Status != stQueued {
 				continue
 			}
-			if !bestSet || e.Tx.Fee > bestFee || (e.Tx.Fee == bestFee && id < bestID) {
+			if !bestSet || higherPriority(e.Tx.Fee, id, bestFee, bestID) {
 				bestID = id
 				bestFee = e.Tx.Fee
 				bestSet = true
