@@ -8,6 +8,79 @@
 go test ./...
 ```
 
+## 完整示例：竞争候选通过投票胜出
+
+[`examples/contending-candidate/main.go`](examples/contending-candidate/main.go)
+是一个可直接运行的完整程序，演示竞争候选如何在投票中胜过本地提议：
+
+```bash
+go run ./examples/contending-candidate
+```
+
+示例用固定种子、四名验证者、单块上限两笔交易，在新的临时状态目录建立节点
+（演示密钥由固定字节派生以便输出可复现，真实应用应随机生成）。随后提交两笔
+分属 Alice 与 Bob、序号均为 1、到期轮次足够远的交易，费用分别为 20 与 10。
+实际输出（标识均来自运行时的真实返回值）：
+
+```
+节点已建立：轮次 1，单块上限 2，验证者 4 名（确认需严格超过 2/3，即至少 3 票）
+已提交 Alice 交易（费用 20）：5c84562f4ed949f6e3c24a9ac9451494c616feac288f56f575a0c9a126dc3086
+已提交 Bob 交易（费用 10）：43178cc218d6bac459593578a04b9304de9a0a483ae0cbfc0e13cabbec7b0ff9
+
+本地提议（轮次 1）：区块 eb5bee8d9c5c31ff4a3d4a3cbd80f34191ffe5c33fa2ef2b9508682626f83260
+  打包顺序 1：5c84562f4ed949f6e3c24a9ac9451494c616feac288f56f575a0c9a126dc3086
+  打包顺序 2：43178cc218d6bac459593578a04b9304de9a0a483ae0cbfc0e13cabbec7b0ff9
+竞争候选（仅含 Alice 交易）：区块 3a47cd87799e600ad20846944b9b6e40de6654efc2dfe00895ef6e3aab9fa8b9（新登记=true）
+
+验证者 0 投给本地提议：计入=true，确认=false
+验证者 1 投给竞争候选：计入=true，确认=false
+验证者 0 改投被拒绝（预期）：already-voted: validator 8a88e3dd… already voted for candidate eb5bee8d… in round 1 and cannot switch to 3a47cd87…
+验证者 2 投给竞争候选：计入=true，确认=false（2 票未达 3 票门槛）
+此时轮次 1 仍未决出：
+  候选 3a47cd87799e600a…（本地=false）结果=pending，票数=2
+  候选 eb5bee8d9c5c31ff…（本地=true）结果=pending，票数=1
+验证者 3 投给竞争候选：计入=true，确认=true，新区块高度 1
+
+轮次 1 已决出（节点当前轮次 2）：
+  候选 3a47cd87799e600a…（本地=false）结果=won，投票者：
+    8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394
+    ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c
+    ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1
+  候选 eb5bee8d9c5c31ff…（本地=true）结果=lost，投票者：
+    8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c
+
+Alice 交易：状态=confirmed，所在块高度=1，区块=3a47cd87799e600ad20846944b9b6e40de6654efc2dfe00895ef6e3aab9fa8b9
+Alice 账户：已确认序号=1，待处理交易=0 笔
+Bob 交易：状态=queued
+Bob 账户：已确认序号=0
+  待处理 43178cc218d6bac4…：状态=queued，说明=waiting-pack
+
+确认历史共 1 条，最新块高度 1、区块 3a47cd87799e600ad20846944b9b6e40de6654efc2dfe00895ef6e3aab9fa8b9（即胜出的竞争候选）
+```
+
+结果说明：
+
+- **打包顺序**：本地提议包含两笔交易，按现有打包规则费用高者在前，故费用 20
+  的 Alice 交易排在费用 10 的 Bob 交易之前。
+- **两个候选的区别**：本地提议（`eb5bee8d…`，含两笔交易）与竞争候选
+  （`3a47cd87…`，仅含 Alice 交易）同轮、同高度、接在同一前块之后，仅交易
+  列表不同，因此区块标识不同；后续投票与查询都使用实际返回的这两个标识。
+- **票数门槛**：四名验证者要求票数严格超过 2/3，即至少 3 票。竞争候选拿到
+  2 票时轮次仍未决出（两个候选都是 `pending`），第 3 票才使它立即确认。
+- **改投拒绝**：验证者 0 已投本地提议，确认前改投竞争候选被 `already-voted`
+  拒绝；程序用 `errors.As` 取出 `*consensus.RejectError` 并核对
+  `Reason == consensus.ReasonAlreadyVoted`，把这个预期拒绝与其他失败区分开。
+  原票仍属于本地提议（轮次查询中本地提议票数保持为 1），竞争候选票数不增加，
+  后续合法投票照常进行。
+- **轮次结果**：用确认前保存的轮次值查询刚结束的轮次（节点此时已进入第 2
+  轮），竞争候选 `won`、本地提议 `lost`，各自保留的投票者按公钥列出。
+- **交易与账户**：费用 20 的 Alice 交易关联胜出块（高度 1）并显示
+  `confirmed`，Alice 账户已确认序号推进为 1；仅被本地提议引用的 Bob 交易
+  回到 `queued`，Bob 账户已确认序号仍为 0，账户查询显示该笔 `waiting-pack`
+  （等待打包）。
+- **确认历史**：落选的本地提议不会生成另一条确认历史——确认历史只有胜出块
+  一条，其标识即竞争候选的区块标识。
+
 ## 能力概览
 
 - `consensus.New(dir, Config)` / `consensus.Open(dir)`：初始化与恢复；配置包含
